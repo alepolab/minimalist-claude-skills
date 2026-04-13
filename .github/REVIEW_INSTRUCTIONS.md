@@ -5,20 +5,49 @@
 
 ---
 
+## Phase 0 — Understand Before You Judge
+
+Before raising ANY finding, you MUST first understand the code. Identify and state:
+
+1. **PURPOSE** — What business problem does this PR solve?
+2. **BUSINESS RULES & INVARIANTS** — What rules can you infer from the code?
+3. **TECH STACK** — Language idioms, framework conventions, build system in use.
+4. **CONCURRENCY MODEL** — Single-threaded, async, multi-threaded, actor-based? This determines which static-analysis checks apply.
+5. **CONTEXT GAPS** — Things you cannot assess without more information (requirements doc, surrounding codebase, infra setup).
+
+---
+
 ## PR Summary Format (Post as top-level PR comment via `gh pr comment`)
 
-Every review MUST start with a single top-level comment containing:
+Every review MUST start with a single top-level comment containing ALL of the following sections. Do NOT split into multiple comments.
 
 ### 📋 Review Summary
 
-**What this PR does**: 2-3 sentence plain-English summary of the change and its purpose.
+#### 0. Code Understanding
+**Purpose:** [What this PR does — 2-3 sentence plain-English summary]
+**Business Rules Identified:** [Numbered list of inferred rules/invariants]
+**Tech Stack / Conventions Detected:** [Language, framework, patterns]
+**Concurrency Model:** [Single-threaded / async / multi-threaded / actor]
+**Context Gaps:** [What cannot be assessed without more information]
+
+#### 1. Summary Scorecard
+
+| Dimension                         | Rating (1–5) | One-line verdict |
+|-----------------------------------|--------------|------------------|
+| Correctness & Safety              |              |                  |
+| Static Analysis Risk (Infer-class)|              |                  |
+| Design & Architecture             |              |                  |
+| Readability & Naming              |              |                  |
+| Performance                       |              |                  |
+| Testability                       |              |                  |
+| Overall                           |              |                  |
 
 **Risk Assessment**: Rate as `🟢 Low` | `🟡 Medium` | `🔴 High` based on:
 - Scope: How many files/systems touched?
 - Blast radius: What breaks if this is wrong? (auth, payments, data integrity = high)
 - Reversibility: Can this be rolled back easily?
 
-**Changes Walkthrough**:
+#### 2. Changes Walkthrough
 
 | File | Change Summary |
 |------|---------------|
@@ -27,7 +56,17 @@ Every review MUST start with a single top-level comment containing:
 **Data Flow** (for non-trivial PRs): Describe how data moves through changed code paths.
 Example: `HTTP Request → AuthMiddleware → UserService.update() → PostgreSQL → AuditLog.emit() → Response`
 
-**Key Findings**: Bullet the top 3-5 issues with severity emoji.
+#### 3. Key Findings
+Bullet ALL issues found with severity emoji. For static-analysis findings, include bug type and certainty (DEFINITE/POTENTIAL). Do not limit or truncate — report every finding.
+
+#### 4. What's Working Well
+[Specific positive callouts — good null guards, correct lock discipline, clean resource management, well-bounded loops, safe data flow. Be specific, not generic.]
+
+#### 5. Priority Actions
+[ALL actions the author should take, ordered by priority. DEFINITE static-analysis bugs always rank first, then MUST FIX, then SHOULD FIX.]
+
+#### 6. Questions for the Author
+[Clarifications needed before final verdict — threading assumptions, ownership contracts, intentional nullability decisions, etc.]
 
 ---
 
@@ -48,13 +87,46 @@ Post each finding as an inline comment on the exact line. Format:
 ```
 ```
 
+For static-analysis findings, use this extended format:
+
+```
+<SEVERITY_EMOJI> <Severity> [STATIC-ANALYSIS] — <Short title>
+**Bug Type**: <e.g. NULL_DEREFERENCE | RESOURCE_LEAK | THREAD_SAFETY_VIOLATION | TAINT_ERROR>
+**Certainty**: <DEFINITE | POTENTIAL>
+**Checker**: <Pulse | RacerD | InferBO | Starvation | Quandary | Scope Leakage>
+
+**Trace**: <step-by-step path from source to problem site, across function boundaries>
+
+<Description — explain WHY this is a problem>
+
+**Impact**: <crash, data corruption, security breach, thread starvation, memory exhaustion>
+
+**Suggested fix**:
+```<language>
+<corrected code>
+```
+```
+
 **Category tags**: [Bug], [Security], [Performance], [Error Handling], [Concurrency],
 [API Design], [Testing], [Code Quality], [Documentation], [Breaking Change],
-[Observability], [Dependency], [Infrastructure], [Input Validation]
+[Observability], [Dependency], [Infrastructure], [Input Validation],
+[Static-Analysis], [Design]
 
 ---
 
 ## Review Dimensions
+
+### IMPORTANT: Interprocedural Reasoning
+
+For ALL checks below: do NOT limit analysis to the current function.
+Trace values through:
+- Callee return values that feed into checked operations
+- Caller-supplied arguments that are stored and used later
+- Object fields written in one method and read in another
+- Callbacks, lambdas, and async continuations
+- Cross-file data flows (e.g., a function in file A returns a value consumed in file B)
+
+When the diff context is insufficient, read the full file to trace these flows.
 
 ### 1. Correctness & Logic Bugs
 
@@ -173,6 +245,35 @@ Flag ALL security issues as 🔴 Important [Security].
 - Goroutine/async task leaks (missing cancellation, unbounded spawning)
 - Incorrect use of volatile/atomic types
 
+### 6-B. Infer-Class Static Analysis (Interprocedural)
+
+Perform the following checks as if running Facebook Infer, RacerD, InferBO, Pulse,
+and Starvation. For each finding: state BUG TYPE, LOCATION, TRACE (step-by-step
+path across function boundaries), and whether it is DEFINITE or POTENTIAL.
+
+**Memory Safety (Pulse / Biabduction)**:
+- `NULL_DEREFERENCE` — Reference used without null check where callee can return null. Conditional null check on one path but not all paths.
+- `USE_AFTER_FREE` / `USE_AFTER_DELETE` — Pointer/reference used after being freed/closed, even via aliasing.
+- `UNINITIALIZED_VALUE` — Variable read before written on all execution paths.
+- `MEMORY_LEAK` / `RESOURCE_LEAK` — Heap object, file, socket, DB connection, lock, or stream acquired but not released on ALL exit paths (including early-return and exception paths). Objects allocated in loops but released only once outside.
+- `BUFFER_OVERRUN` / `ARRAY_OUT_OF_BOUNDS` — Array/slice accesses with unvalidated lengths, index from user input without range check, off-by-one on loop bounds.
+
+**Concurrency (RacerD / Starvation)**:
+- `THREAD_SAFETY_VIOLATION` / `DATA_RACE` — Field/shared object read or written from multiple goroutines/threads without synchronization. Read-check-then-act on shared variable that could race.
+- `DEADLOCK` — Two or more locks acquired in inconsistent orders across different code paths.
+- `STARVATION` — Blocking I/O, DB query, or sleep on event loop, UI thread, or goroutine that must stay responsive.
+- `ATOMICITY_VIOLATION` — Read-modify-write on shared state not wrapped in a single synchronized/locked block.
+
+**Taint & Data Flow (Pulse / Quandary)**:
+- `TAINT_ERROR` / `DATA_FLOW_TO_SINK` — Untrusted input flows to sensitive sink (SQL, OS command, HTML, file path, log) without sanitization. Trace from source (HTTP param, env var, file read) to sink across all transformations.
+- `SQL_INJECTION` — SQL assembled via concatenation with unvalidated data.
+- `SENSITIVE_DATA_LEAK` — PII, credentials, tokens written to logs, error messages, URLs, or observable channels.
+
+**Object Lifecycle (Scope Leakage)**:
+- `SCOPE_LEAKAGE` — Long-lived object (singleton, global, application scope) holds reference to short-lived object (request, transaction scope), causing it to outlive its intended lifetime.
+
+**Certainty Rule**: Do NOT report a POTENTIAL bug as DEFINITE without tracing a concrete execution path that triggers it.
+
 ### 7. API Design & Contracts
 
 - Breaking changes to existing API contracts (removed fields, type changes, renamed endpoints)
@@ -199,6 +300,32 @@ Flag ALL security issues as 🔴 Important [Security].
 - Missing integration tests for critical paths (auth, payments, data migrations)
 - If PR fixes a bug → where is the regression test?
 - Test data using hardcoded IDs that could collide
+
+### 8-B. Design & Architecture Principles
+
+Evaluate each principle against the changed code. Cite exact location for each violation.
+
+**Responsibility & Cohesion**:
+- SRP — Does each class/function have exactly one reason to change? Flag units that do orchestration AND business logic AND I/O together.
+- High Cohesion — Do the members of each module genuinely belong together? Flag "utility bags" and "god objects."
+- SLAP (Single Level of Abstraction) — Does each function stay at one logical level? Flag mixing high-level orchestration with low-level details.
+
+**Coupling & Dependencies**:
+- DIP — Are dependencies on abstractions, not concretions? Flag direct instantiation of concrete classes inside business logic.
+- Law of Demeter — Method chains longer than 2 hops? Flag reaching deep into objects a method shouldn't know about.
+- Low Coupling — Would changing one module force changes in many others?
+
+**Extensibility & Contracts**:
+- OCP — Would adding a new variant require editing existing code? Flag large if/else or switch chains on type/kind fields.
+- LSP — Can every subtype substitute for its base type? Flag overrides that throw, ignore, or narrow the parent contract.
+- ISP — Are interfaces too broad? Flag implementors forced to define methods they don't use.
+
+**Simplicity**:
+- DRY — Copy-pasted or near-duplicated logic?
+- KISS — Solution more complex than the problem demands?
+- YAGNI — Speculative code, unused parameters, dead branches?
+- Composition over Inheritance — Deep inheritance hierarchies (>2 levels)?
+- Tell, Don't Ask — Asking object state then deciding externally?
 
 ### 9. Code Quality & Maintainability
 
@@ -310,6 +437,13 @@ When PRs touch infra files:
 ---
 
 ## Review Behavior Rules
+
+### Complete-Then-Post (CRITICAL)
+- Read the ENTIRE diff and ALL relevant source files BEFORE posting any comment.
+- Analyze ALL dimensions across ALL files BEFORE posting any comment.
+- Post the PR Summary comment FIRST, then ALL inline comments.
+- NEVER post comments while still reading or analyzing files.
+- ONE comprehensive review pass, not gradual file-by-file commenting.
 
 ### Incremental Review
 - Focus on NEWLY ADDED OR MODIFIED lines only.
